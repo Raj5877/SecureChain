@@ -1,0 +1,7 @@
+[project]
+name = "securechain"
+version = "1.0.0"
+description = "Digital evidence chain of custody and integrity verification"
+requires-python = ">=3.11"
+dependencies = ["Flask>=3.1.2,<4", "cryptography>=46.0.7,<47", "Werkzeug>=3.1.5,<4", "requests>=2.32.3,<3", "waitress>=3.0.2,<4"]
+
