@@ -80,6 +80,12 @@ def create_app(config=None):
 
     @app.before_request
     def csrf_guard():
+        # Reject oversized evidence requests before parsing multipart content.
+        if request.method == "POST" and (request.path == "/api/evidence" or
+                (request.path.startswith("/api/evidence/") and request.path.endswith("/verify"))):
+            request.max_content_length = service.max_file_size + 256 * 1024
+        elif request.path in {"/api/packages/import", "/api/node/receive"}:
+            request.max_content_length = service.max_package_size + 256 * 1024
         if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.path != "/api/node/receive":
             expected = session.get("csrf")
             submitted = request.headers.get("X-CSRF-Token", "")
@@ -101,7 +107,12 @@ def create_app(config=None):
 
     @app.errorhandler(Problem)
     def problem(exc):
-        return jsonify(error=str(exc)), exc.status
+        body = {"error": str(exc)}
+        if exc.analysis and request.path != "/api/node/receive" and current_user():
+            body.update(analysis=exc.analysis, evidence_id=exc.analysis.get("evidence_id"))
+        elif exc.analysis and request.path == "/api/node/receive":
+            body["error"] = "Transfer package rejected. Check the receiving node audit log."
+        return jsonify(body), exc.status
 
     @app.errorhandler(HTTPException)
     def http_error(exc):
@@ -178,6 +189,12 @@ def create_app(config=None):
         service.log(None, user["username"], "dashboard_accessed")
         return jsonify(service.summary())
 
+    @app.get("/api/updates")
+    @authenticated()
+    def updates(user):
+        # Background refreshes must not add audit events of their own.
+        return jsonify(service.summary())
+
     @app.post("/api/evidence")
     @authenticated("admin", "investigator")
     def register(user):
@@ -194,6 +211,7 @@ def create_app(config=None):
         record = service.record(evidence_id)
         service.log(evidence_id, user["username"], "accessed")
         return jsonify(id=evidence_id, manifest=record["manifest"], status=record["status"], last_verified=record["last_verified"],
+                       archived=record["archived"], archived_at=record["archived_at"], archived_by=record["archived_by"],
                        signature=record["signature"], signer_key=record["signer_key"], custody=service.history(record),
                        custody_valid=validate_history(service.history(record), evidence_id))
 
@@ -204,7 +222,18 @@ def create_app(config=None):
         candidate = file.read(service.max_file_size + 1) if file else None
         if candidate is not None and len(candidate) > service.max_file_size:
             raise Problem("Candidate exceeds the file size limit.", 413)
-        return jsonify(service.verify_evidence(evidence_id, user["username"], candidate))
+        return jsonify(service.verify_evidence(evidence_id, user["username"], candidate,
+                                              candidate_name=file.filename if file else None))
+
+    @app.post("/api/evidence/<evidence_id>/archive")
+    @authenticated("admin", "investigator")
+    def archive(user, evidence_id):
+        return jsonify(service.archive_evidence(evidence_id, user["username"]))
+
+    @app.post("/api/evidence/<evidence_id>/restore")
+    @authenticated("admin", "investigator")
+    def restore(user, evidence_id):
+        return jsonify(service.restore_evidence(evidence_id, user["username"]))
 
     @app.get("/api/evidence/<evidence_id>/download")
     @authenticated()
@@ -234,6 +263,14 @@ def create_app(config=None):
         node_id = service.add_peer(data.get("descriptor"), text_field(data, "url"), text_field(data, "token"), user["username"])
         return jsonify(node_id=node_id), 201
 
+    @app.put("/api/peers/<node_id>")
+    @authenticated("admin")
+    def update_peer(user, node_id):
+        data = json_body()
+        return jsonify(service.update_peer(node_id, text_field(data, "url"),
+                                           text_field(data, "token") if "token" in data else None,
+                                           user["username"]))
+
     @app.post("/api/evidence/<evidence_id>/export")
     @authenticated("admin", "investigator")
     def export(user, evidence_id):
@@ -251,7 +288,7 @@ def create_app(config=None):
         file = request.files.get("file")
         if not file:
             raise Problem("Choose a SecureChain package.")
-        receipt = service.receive_package(file.read(), user["username"])
+        receipt = service.receive_package(file.read(service.max_package_size + 1), user["username"])
         return jsonify(receipt), 201
 
     @app.post("/api/node/receive")
@@ -302,9 +339,9 @@ def create_app(config=None):
     @authenticated()
     def metrics(user):
         service.log(None, user["username"], "metrics_exported")
-        rows = service.db.rows("SELECT evidence_id,operation,hash_ms,signature_ms,total_ms,size_bytes,created_at FROM metrics ORDER BY id")
+        rows = service.db.rows("SELECT evidence_id,operation,hash_ms,signature_ms,encryption_ms,decryption_ms,total_ms,size_bytes,created_at FROM metrics ORDER BY id")
         output = io.StringIO(newline="")
-        writer = csv.DictWriter(output, fieldnames=["evidence_id", "operation", "hash_ms", "signature_ms", "total_ms", "size_bytes", "created_at"])
+        writer = csv.DictWriter(output, fieldnames=["evidence_id", "operation", "hash_ms", "signature_ms", "encryption_ms", "decryption_ms", "total_ms", "size_bytes", "created_at"])
         writer.writeheader()
         writer.writerows(rows)
         return send_file(io.BytesIO(output.getvalue().encode()), mimetype="text/csv", as_attachment=True, download_name="securechain-metrics.csv")

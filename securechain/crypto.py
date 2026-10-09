@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
@@ -128,13 +129,24 @@ class Keyring:
         return {**body, "signature": sign(self.signing, canonical(body))}
 
 
-def seal(payload: dict, recipient_pem: str, recipient_id: str, sender_id: str, signing_key) -> dict:
+def seal(payload: dict, recipient_pem: str, recipient_id: str, sender_id: str, signing_key, timings=None) -> dict:
     key = AESGCM.generate_key(bit_length=256)
     header = {"format": "securechain-envelope", "version": 1, "recipient": recipient_id, "sender": sender_id}
-    body = {**header, "wrapped_key": b64(load_public(recipient_pem).encrypt(key, padding.OAEP(
-        mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None))),
-        "ciphertext": b64(encrypt(key, canonical(payload), canonical(header)))}
-    return {**body, "signature": sign(signing_key, canonical(body))}
+    recipient = load_public(recipient_pem)
+    plaintext, aad = canonical(payload), canonical(header)
+    start = time.perf_counter()
+    wrapped_key = recipient.encrypt(key, padding.OAEP(
+        mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+    ciphertext = encrypt(key, plaintext, aad)
+    encryption_ms = round((time.perf_counter() - start) * 1000, 6)
+    body = {**header, "wrapped_key": b64(wrapped_key), "ciphertext": b64(ciphertext)}
+    signed_bytes = canonical(body)
+    start = time.perf_counter()
+    signature = sign(signing_key, signed_bytes)
+    signature_ms = round((time.perf_counter() - start) * 1000, 6)
+    if timings is not None:
+        timings.update(encryption_ms=encryption_ms, signature_ms=signature_ms)
+    return {**body, "signature": signature}
 
 
 def open_envelope(envelope: dict, recipient_id: str, private_key, sender_pem: str) -> dict:

@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS evidence (
     status TEXT NOT NULL DEFAULT 'verified' CHECK(status IN ('verified','unverified','alert')),
     last_verified TEXT, registered_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS evidence_archive (
+    evidence_id TEXT PRIMARY KEY REFERENCES evidence(id), archived_at TEXT NOT NULL,
+    archived_by TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY, evidence_id TEXT, payload TEXT NOT NULL, previous_hash TEXT NOT NULL,
     event_hash TEXT NOT NULL UNIQUE, signature TEXT NOT NULL, public_key TEXT NOT NULL
@@ -27,12 +31,13 @@ CREATE TABLE IF NOT EXISTS peers (
 CREATE TABLE IF NOT EXISTS transfers (
     id TEXT PRIMARY KEY, evidence_id TEXT NOT NULL, peer_id TEXT NOT NULL, direction TEXT NOT NULL,
     status TEXT NOT NULL, bytes INTEGER NOT NULL, elapsed_ms REAL NOT NULL,
-    created_at TEXT NOT NULL, detail TEXT NOT NULL
+    created_at TEXT NOT NULL, detail TEXT NOT NULL, encryption_ms REAL, decryption_ms REAL
 );
 CREATE TABLE IF NOT EXISTS receipts (package_id TEXT PRIMARY KEY, evidence_id TEXT NOT NULL, received_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS metrics (
     id INTEGER PRIMARY KEY, evidence_id TEXT, operation TEXT NOT NULL,
-    hash_ms REAL NOT NULL, signature_ms REAL NOT NULL, total_ms REAL NOT NULL, size_bytes INTEGER NOT NULL, created_at TEXT NOT NULL
+    hash_ms REAL NOT NULL, signature_ms REAL NOT NULL, total_ms REAL NOT NULL, size_bytes INTEGER NOT NULL, created_at TEXT NOT NULL,
+    encryption_ms REAL, decryption_ms REAL
 );
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY, evidence_id TEXT, message TEXT NOT NULL, created_at TEXT NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0
@@ -51,6 +56,13 @@ class Database:
         self.path = path
         with self.connect() as db:
             db.executescript(SCHEMA)
+            # Preserve existing measurements; NULL means the time was not recorded.
+            db.execute("BEGIN IMMEDIATE")
+            for table in ("metrics", "transfers"):
+                columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+                for column in ("encryption_ms", "decryption_ms"):
+                    if column not in columns:
+                        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} REAL")
 
     @contextmanager
     def connect(self):

@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 
 import requests
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
 from werkzeug.security import generate_password_hash
 from werkzeug.utils import secure_filename
 
@@ -28,9 +30,10 @@ def milliseconds(start):
 
 
 class Problem(ValueError):
-    def __init__(self, message, status=400):
+    def __init__(self, message, status=400, analysis=None):
         super().__init__(message)
         self.status = status
+        self.analysis = analysis
 
 
 def validate_history(history, evidence_id=None):
@@ -69,6 +72,8 @@ class EvidenceService:
         self.db = Database(directory / "securechain.sqlite3")
         self.name = name
         self.max_file_size = max_file_size
+        # Nested base64 adds about 78% to the original evidence size.
+        self.max_package_size = 2 * max_file_size + 8 * 1024 * 1024
         self.allow_loopback = allow_loopback
 
     def create_user(self, username, name, password, role="investigator", actor=None, initial=False):
@@ -77,8 +82,19 @@ class EvidenceService:
             raise Problem("Username must contain 1–64 letters, numbers, dots, hyphens or underscores.")
         if not name.strip() or len(name) > 120:
             raise Problem("Enter a name of up to 120 characters.")
-        if len(password) < 12 or len(password) > 256:
+        if not 12 <= len(password) <= 256:
             raise Problem("Use a password of 12–256 characters.")
+        missing = []
+        if not any("A" <= char <= "Z" for char in password):
+            missing.append("an uppercase letter")
+        if not any("a" <= char <= "z" for char in password):
+            missing.append("a lowercase letter")
+        if not any("0" <= char <= "9" for char in password):
+            missing.append("a number")
+        if not any(not char.isalnum() and not char.isspace() for char in password):
+            missing.append("a special character")
+        if missing:
+            raise Problem("Password must include " + ", ".join(missing) + ".")
         if role not in {"admin", "investigator", "viewer"}:
             raise Problem("Invalid role.")
         key = crypto.new_key()
@@ -119,19 +135,45 @@ class EvidenceService:
         return rows
 
     def record(self, evidence_id):
-        row = self.db.one("SELECT * FROM evidence WHERE id=?", (evidence_id,))
+        row = self.db.one("SELECT e.*, a.archived_at, a.archived_by FROM evidence e LEFT JOIN evidence_archive a ON a.evidence_id=e.id WHERE e.id=?", (evidence_id,))
         if not row:
             raise Problem("Evidence not found.", 404)
         row["manifest"] = json.loads(row["manifest"])
         row["imported_history"] = json.loads(row["imported_history"])
+        row["archived"] = bool(row["archived_at"])
         return row
 
     def history(self, record):
         return record["imported_history"] + self.events(record["id"])
 
-    def list_evidence(self):
-        rows = self.db.rows("SELECT id,manifest,status,last_verified,registered_at FROM evidence ORDER BY registered_at DESC,id")
-        return [{**row, "manifest": json.loads(row["manifest"])} for row in rows]
+    def list_evidence(self, archived=False):
+        rows = self.db.rows(
+            "SELECT e.id,e.manifest,e.status,e.last_verified,e.registered_at,a.archived_at,a.archived_by "
+            "FROM evidence e LEFT JOIN evidence_archive a ON a.evidence_id=e.id "
+            "WHERE a.evidence_id IS " + ("NOT NULL" if archived else "NULL") + " ORDER BY e.registered_at DESC,e.id"
+        )
+        return [{**row, "manifest": json.loads(row["manifest"]), "archived": bool(row["archived_at"])} for row in rows]
+
+    def archive_evidence(self, evidence_id, actor):
+        self.record(evidence_id)
+        archived_at = now()
+        with self.db.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT evidence_id FROM evidence_archive WHERE evidence_id=?", (evidence_id,)).fetchone():
+                raise Problem("This evidence record is already archived.", 409)
+            db.execute("INSERT INTO evidence_archive VALUES(?,?,?)", (evidence_id, archived_at, actor))
+            self._append(db, evidence_id, actor, "evidence_archived", {"archived_at": archived_at, "original_retained": True})
+        return {"evidence_id": evidence_id, "archived": True, "archived_at": archived_at}
+
+    def restore_evidence(self, evidence_id, actor):
+        self.record(evidence_id)
+        with self.db.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT evidence_id FROM evidence_archive WHERE evidence_id=?", (evidence_id,)).fetchone():
+                raise Problem("This evidence record is already active.", 409)
+            db.execute("DELETE FROM evidence_archive WHERE evidence_id=?", (evidence_id,))
+            self._append(db, evidence_id, actor, "evidence_restored", {"original_retained": True})
+        return {"evidence_id": evidence_id, "archived": False}
 
     def register(self, data: bytes, filename, metadata, user):
         total_start = time.perf_counter()
@@ -169,34 +211,47 @@ class EvidenceService:
         signature_ms = milliseconds(start)
         blob_name = uuid.uuid4().hex + ".enc"
         path = self.vault / blob_name
-        crypto.write_secret(path, crypto.encrypt(self.keys.master, data, evidence_id.encode()))
+        start = time.perf_counter()
+        encrypted = crypto.encrypt(self.keys.master, data, evidence_id.encode())
+        encryption_ms = milliseconds(start)
+        crypto.write_secret(path, encrypted)
         try:
             with self.db.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 db.execute("INSERT INTO evidence(id,manifest,signature,signer_key,blob_name,status,last_verified,registered_at) VALUES(?,?,?,?,?,?,?,?)",
                     (evidence_id, crypto.canonical(manifest).decode(), signature, user["public_key"], blob_name, "verified", now(), now()))
                 self._append(db, evidence_id, user["username"], "registered", {"sha256": file_hash, "source": manifest["source"], "source_kind": source_kind})
-                self._metric(db, evidence_id, "registration", hash_ms, signature_ms, milliseconds(total_start), len(data))
+                self._metric(db, evidence_id, "registration", hash_ms, signature_ms, milliseconds(total_start), len(data), encryption_ms=encryption_ms)
         except Exception:
             path.unlink(missing_ok=True)
             raise
         return evidence_id
 
-    def _metric(self, db, evidence_id, operation, hash_ms, signature_ms, total_ms, size):
-        db.execute("INSERT INTO metrics(evidence_id,operation,hash_ms,signature_ms,total_ms,size_bytes,created_at) VALUES(?,?,?,?,?,?,?)",
-            (evidence_id, operation, hash_ms, signature_ms, total_ms, size, now()))
+    def _metric(self, db, evidence_id, operation, hash_ms, signature_ms, total_ms, size, encryption_ms=None, decryption_ms=None):
+        db.execute("INSERT INTO metrics(evidence_id,operation,hash_ms,signature_ms,total_ms,size_bytes,created_at,encryption_ms,decryption_ms) VALUES(?,?,?,?,?,?,?,?,?)",
+            (evidence_id, operation, hash_ms, signature_ms, total_ms, size, now(), encryption_ms, decryption_ms))
 
     def _read(self, record):
-        return crypto.decrypt(self.keys.master, (self.vault / record["blob_name"]).read_bytes(), record["id"].encode())
+        return self._read_timed(record)[0]
 
-    def verify_evidence(self, evidence_id, actor, candidate=None):
+    def _read_timed(self, record):
+        encrypted = (self.vault / record["blob_name"]).read_bytes()
+        start = time.perf_counter()
+        data = crypto.decrypt(self.keys.master, encrypted, record["id"].encode())
+        return data, milliseconds(start)
+
+    def verify_evidence(self, evidence_id, actor, candidate=None, candidate_name=None):
         total_start = time.perf_counter()
         record = self.record(evidence_id)
         manifest = record["manifest"]
         storage_ok = True
         error = None
+        decryption_ms = None
         try:
-            data = self._read(record) if candidate is None else candidate
+            if candidate is None:
+                data, decryption_ms = self._read_timed(record)
+            else:
+                data = candidate
         except (InvalidTag, OSError, ValueError):
             data = b""
             storage_ok = False
@@ -215,16 +270,51 @@ class EvidenceService:
         signature_ms = milliseconds(start)
         history_ok = validate_history(self.history(record), evidence_id)
         passed = bool(hash_ok and signature_ok and history_ok)
+        target = "vault" if candidate is None else "candidate"
+        candidate_name = (secure_filename(candidate_name or "candidate.bin")[:180] or "candidate.bin") if candidate is not None else None
+        failures = []
+        if not storage_ok:
+            failures.append(error)
+        elif not hash_ok:
+            if computed != manifest["sha256"]:
+                failures.append("Candidate SHA-256 differs from the registered original." if candidate is not None else "Vault original SHA-256 differs from the registration manifest.")
+            if len(data) != manifest["size_bytes"]:
+                failures.append(f"File size differs: expected {manifest['size_bytes']:,} bytes, checked {len(data):,} bytes.")
+        if not signature_ok:
+            failures.append("The original handler signature or signing-key fingerprint is invalid.")
+        if not history_ok:
+            failures.append("A custody signature, sequence, or hash link is invalid.")
+        error = " ".join(failures) if failures else None
+        summary = ("The external candidate matches the registered original." if passed else "The external candidate failed comparison with the registered original.") if candidate is not None else ("The encrypted vault original passed every integrity check." if passed else "The encrypted vault original failed integrity verification.")
+        if candidate is not None:
+            summary += " The vault original was not modified; its current storage was not checked in this candidate comparison."
+        analysis = {
+            "summary": summary, "reason": error, "evidence_id": evidence_id, "target": target,
+            "candidate_name": candidate_name, "failure_reasons": failures,
+            "checks": [
+                {"key": "hash", "label": "SHA-256 and byte count match", "status": "passed" if hash_ok else "failed",
+                 "detail": "The checked bytes match the acquisition manifest." if hash_ok else (error if not storage_ok else "The checked bytes or byte count differ from the acquisition manifest.")},
+                {"key": "handler_signature", "label": "Original handler signature", "status": "passed" if signature_ok else "failed",
+                 "detail": "The signed registration manifest is valid." if signature_ok else "The signed registration manifest could not be validated."},
+                {"key": "custody", "label": "Signed custody history", "status": "passed" if history_ok else "failed",
+                 "detail": "Every custody signature, sequence and hash link is valid." if history_ok else "The custody chain contains an invalid signature, sequence or hash link."},
+                {"key": "storage", "label": "External candidate readable" if candidate is not None else "Authenticated vault storage",
+                 "status": "passed" if storage_ok else "failed",
+                 "detail": "The uploaded candidate was read for comparison; the vault original was not read." if candidate is not None else ("The encrypted original was read and AES-GCM authentication passed." if storage_ok else error)},
+            ],
+        }
         result = {"evidence_id": evidence_id, "passed": passed, "hash_valid": bool(hash_ok), "signature_valid": bool(signature_ok),
                   "custody_valid": history_ok, "storage_valid": storage_ok, "expected_sha256": manifest["sha256"], "computed_sha256": computed,
-                  "checked_at": now(), "target": "vault" if candidate is None else "candidate",
-                  "hash_ms": hash_ms, "signature_ms": signature_ms, "total_ms": milliseconds(total_start), "error": error}
+                  "checked_at": now(), "target": target, "candidate_name": candidate_name, "analysis": analysis,
+                  "expected_size_bytes": manifest["size_bytes"], "computed_size_bytes": len(data) if storage_ok else None,
+                  "hash_ms": hash_ms, "signature_ms": signature_ms, "decryption_ms": decryption_ms,
+                  "total_ms": milliseconds(total_start), "error": error}
         with self.db.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if candidate is None:
                 db.execute("UPDATE evidence SET status=?,last_verified=? WHERE id=?", ("verified" if passed else "alert", now(), evidence_id))
             self._append(db, evidence_id, actor, "verified" if passed else "verification_failed", result)
-            self._metric(db, evidence_id, "verification", hash_ms, signature_ms, result["total_ms"], len(data))
+            self._metric(db, evidence_id, "verification" if candidate is None else "candidate_verification", hash_ms, signature_ms, result["total_ms"], len(data), decryption_ms=decryption_ms)
             if not passed:
                 db.execute("INSERT INTO alerts(evidence_id,message,created_at) VALUES(?,?,?)",
                     (evidence_id, error or ("Candidate differs from the registered original." if candidate is not None else "Evidence integrity, signature or custody check failed."), now()))
@@ -281,15 +371,43 @@ class EvidenceService:
             raise Problem("Peer URLs require HTTPS. HTTP is allowed only for an explicitly enabled loopback demo.")
         return parsed
 
+    def update_peer(self, node_id, url, token, actor):
+        if not isinstance(url, str):
+            raise Problem("Delivery URL must be text.")
+        url = url.strip().rstrip("/")
+        if len(url) > 2048:
+            raise Problem("Delivery URL must be no longer than 2048 characters.")
+        if url:
+            self.validate_peer_url(url)
+        if token is not None and (not isinstance(token, str) or len(token) > 256):
+            raise Problem("Receiver token must be text of up to 256 characters.")
+        with self.db.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            peer = db.execute("SELECT token FROM peers WHERE node_id=?", (node_id,)).fetchone()
+            if not peer:
+                raise Problem("Trusted node not found.", 404)
+            protected_token = peer["token"] if token is None else (
+                crypto.encrypt(self.keys.master, token.encode(), node_id.encode()) if token else None
+            )
+            db.execute("UPDATE peers SET url=?,token=? WHERE node_id=?", (url, protected_token, node_id))
+            self._append(db, None, actor, "peer_updated", {
+                "node_id": node_id, "url": url, "token_changed": token is not None,
+                "token_configured": bool(protected_token), "pinned_identity_retained": True,
+            })
+        return {"node_id": node_id, "url": url, "token_configured": bool(protected_token)}
+
     def peers(self):
-        rows = self.db.rows("SELECT node_id,descriptor,url,added_at FROM peers ORDER BY added_at DESC")
+        rows = self.db.rows("SELECT node_id,descriptor,url,added_at,(token IS NOT NULL) AS token_configured FROM peers ORDER BY added_at DESC")
         for row in rows:
             row["descriptor"] = json.loads(row["descriptor"])
             row["fingerprint"] = crypto.fingerprint(row["descriptor"]["signing_key"])
+            row["token_configured"] = bool(row["token_configured"])
         return rows
 
     def export_package(self, evidence_id, peer_id, actor):
         start = time.perf_counter()
+        if self.record(evidence_id)["archived"]:
+            raise Problem("Restore this archived evidence record before preparing a transfer.", 409)
         peer = self.db.one("SELECT * FROM peers WHERE node_id=?", (peer_id,))
         if not peer:
             raise Problem("Choose a trusted receiving node.")
@@ -297,9 +415,11 @@ class EvidenceService:
         if not result["passed"]:
             raise Problem("Evidence failed verification. Transfer is blocked.", 409)
         record = self.record(evidence_id)
-        data = self._read(record)
+        data, decryption_ms = self._read_timed(record)
+        hash_start = time.perf_counter()
         if crypto.digest(data) != record["manifest"]["sha256"]:
             raise Problem("Evidence changed during transfer preparation.", 409)
+        hash_ms = milliseconds(hash_start)
         package_id = str(uuid.uuid4())
         # Take the custody snapshot in the same transaction as its handoff event.
         # Concurrent views/checks cannot insert a new last event into this package.
@@ -312,79 +432,192 @@ class EvidenceService:
         payload = {"package_id": package_id, "created_at": now(), "manifest": record["manifest"], "evidence_signature": record["signature"],
                    "signer_key": record["signer_key"], "custody": record["imported_history"] + local_history, "content": crypto.b64(data)}
         descriptor = json.loads(peer["descriptor"])
-        package = crypto.canonical(crypto.seal(payload, descriptor["encryption_key"], peer_id, self.keys.node_id, self.keys.signing))
-        self._transfer(package_id, evidence_id, peer_id, "outbound", "prepared", len(package), milliseconds(start), "Encrypted package prepared; delivery not yet confirmed.")
+        timings = {}
+        package = crypto.canonical(crypto.seal(payload, descriptor["encryption_key"], peer_id, self.keys.node_id, self.keys.signing, timings=timings))
+        elapsed = milliseconds(start)
+        self._transfer(package_id, evidence_id, peer_id, "outbound", "prepared", len(package), elapsed, "Encrypted package prepared; delivery not yet confirmed.", encryption_ms=timings["encryption_ms"])
+        with self.db.connect() as db:
+            self._metric(db, evidence_id, "transfer_preparation", hash_ms, timings["signature_ms"], elapsed, len(data), encryption_ms=timings["encryption_ms"], decryption_ms=decryption_ms)
         return package, package_id
 
-    def _transfer(self, package_id, evidence_id, peer_id, direction, status, size, elapsed, detail):
+    def _transfer(self, package_id, evidence_id, peer_id, direction, status, size, elapsed, detail, encryption_ms=None, decryption_ms=None):
         with self.db.connect() as db:
-            db.execute("INSERT INTO transfers(id,evidence_id,peer_id,direction,status,bytes,elapsed_ms,created_at,detail) VALUES(?,?,?,?,?,?,?,?,?)",
-                (package_id, evidence_id, peer_id, direction, status, size, elapsed, now(), detail))
+            db.execute("INSERT INTO transfers(id,evidence_id,peer_id,direction,status,bytes,elapsed_ms,created_at,detail,encryption_ms,decryption_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (package_id, evidence_id, peer_id, direction, status, size, elapsed, now(), detail, encryption_ms, decryption_ms))
 
     def receive_package(self, raw, actor):
         start = time.perf_counter()
-        evidence_id = None
+        evidence_id = package_id = path = None
+        definitions = [
+            ("package_size", "Package size limit"), ("structure", "Package format and structure"),
+            ("recipient", "Addressed to this node"), ("trusted_sender", "Trusted sending node"),
+            ("sender_signature", "Sending node package signature"), ("decryption", "Authenticated package decryption"),
+            ("payload", "Decrypted payload structure"), ("manifest", "Original evidence manifest"),
+            ("file_size", "Evidence file size limit"), ("hash", "Original file SHA-256 and size"),
+            ("handler_signature", "Original handler signature"), ("custody", "Signed custody and handoff history"),
+            ("replay", "Duplicate and replay protection"), ("storage", "Encrypted vault registration"),
+        ]
+        checks = [{"key": key, "label": label, "status": "not_checked", "detail": "This check has not run."} for key, label in definitions]
+        by_key = {item["key"]: item for item in checks}
+        stage = "package_size"
+
+        def passed(key, detail):
+            by_key[key].update(status="passed", detail=detail)
+
+        def reject(message, status=400):
+            raise Problem(message, status)
+
+        generic = {
+            "structure": "The package is not valid JSON or has an invalid envelope structure.",
+            "decryption": "The encrypted package could not be authenticated or decrypted. Its key or ciphertext may be damaged.",
+            "payload": "The decrypted package has invalid content or metadata fields.",
+            "manifest": "The original evidence manifest is invalid.",
+            "file_size": "The package contains invalid or oversized evidence content.",
+            "hash": "Transferred file hash or size differs from the registered original.",
+            "handler_signature": "The original handler key or signature is invalid.",
+            "custody": "The signed custody history or sender handoff is invalid.",
+            "storage": "The verified package could not be saved to the encrypted vault.",
+        }
         try:
+            if len(raw) > self.max_package_size:
+                reject("The encrypted package exceeds this node's package size limit.", 413)
+            passed(stage, f"Package contains {len(raw):,} bytes; limit is {self.max_package_size:,} bytes.")
+
+            stage = "structure"
             envelope = json.loads(raw)
             expected = {"format", "version", "recipient", "sender", "wrapped_key", "ciphertext", "signature"}
-            if not isinstance(envelope, dict) or set(envelope) != expected or any(not isinstance(envelope[field], str) for field in expected - {"version"}):
-                raise Problem("Invalid package.")
-            peer = self.db.one("SELECT descriptor FROM peers WHERE node_id=?", (envelope.get("sender"),))
+            if (not isinstance(envelope, dict) or set(envelope) != expected
+                or any(not isinstance(envelope[field], str) for field in expected - {"version"})
+                or envelope["format"] != "securechain-envelope" or envelope["version"] != 1):
+                reject("Invalid transfer envelope format, version, or fields.")
+            passed(stage, "SecureChain envelope format, version and fields are valid.")
+
+            stage = "recipient"
+            if envelope["recipient"] != self.keys.node_id:
+                reject("This package is not addressed to this node.")
+            passed(stage, "The encrypted package is addressed to this receiving node.")
+
+            stage = "trusted_sender"
+            peer = self.db.one("SELECT descriptor FROM peers WHERE node_id=?", (envelope["sender"],))
             if not peer:
-                raise Problem("Sender is not a trusted peer.", 403)
+                reject("Sender is not a trusted peer.", 403)
             descriptor = json.loads(peer["descriptor"])
-            payload = crypto.open_envelope(envelope, self.keys.node_id, self.keys.encryption, descriptor["signing_key"])
+            passed(stage, "The sending node has a pinned trusted identity on this node.")
+
+            stage = "sender_signature"
+            body = {key: value for key, value in envelope.items() if key != "signature"}
+            signature_start = time.perf_counter()
+            if not crypto.verify(descriptor["signing_key"], crypto.canonical(body), envelope["signature"]):
+                reject("Sending node signature is invalid. The package was changed or was not signed by the trusted sender.")
+            signature_ms = milliseconds(signature_start)
+            passed(stage, "The package signature matches the trusted sender's pinned key.")
+
+            stage = "decryption"
+            wrapped_key, ciphertext = crypto.unb64(envelope["wrapped_key"]), crypto.unb64(envelope["ciphertext"])
+            header = {field: envelope[field] for field in ("format", "version", "recipient", "sender")}
+            aad = crypto.canonical(header)
+            decryption_start = time.perf_counter()
+            key = self.keys.encryption.decrypt(wrapped_key, padding.OAEP(
+                mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+            plaintext = crypto.decrypt(key, ciphertext, aad)
+            decryption_ms = milliseconds(decryption_start)
+            passed(stage, "The recipient key opened the package and AES-GCM authentication passed.")
+
+            stage = "payload"
+            payload = json.loads(plaintext)
+            payload_fields = {"package_id", "created_at", "manifest", "evidence_signature", "signer_key", "custody", "content"}
+            if (not isinstance(payload, dict) or set(payload) != payload_fields
+                or any(not isinstance(payload[field], str) for field in {"package_id", "created_at", "evidence_signature", "signer_key", "content"})
+                or not isinstance(payload["custody"], list)):
+                reject("The decrypted package payload has invalid fields.")
+            package_id = str(uuid.UUID(payload["package_id"]))
+            passed(stage, "Payload fields and package identifier are valid.")
+
+            stage = "manifest"
             manifest = payload["manifest"]
-            evidence_id = manifest["evidence_id"]
             self._validate_manifest(manifest)
+            evidence_id = manifest["evidence_id"]
+            passed(stage, "The acquisition manifest contains valid evidence metadata.")
+
+            stage = "file_size"
+            if manifest["size_bytes"] > self.max_file_size:
+                reject("Package exceeds the evidence file limit.", 413)
             data = crypto.unb64(payload["content"])
             if len(data) > self.max_file_size:
-                raise Problem("Package exceeds the evidence file limit.", 413)
-            if crypto.digest(data) != manifest["sha256"] or len(data) != manifest["size_bytes"]:
-                raise Problem("Transferred file hash differs from the registered original.")
-            if crypto.fingerprint(payload["signer_key"]) != manifest["signer_fingerprint"] or not crypto.verify(payload["signer_key"], crypto.canonical(manifest), payload["evidence_signature"]):
-                raise Problem("Original handler signature is invalid.")
+                reject("Package exceeds the evidence file limit.", 413)
+            passed(stage, f"Evidence contains {len(data):,} bytes; limit is {self.max_file_size:,} bytes.")
+
+            stage = "hash"
+            hash_start = time.perf_counter()
+            computed = crypto.digest(data)
+            hash_ms = milliseconds(hash_start)
+            by_key[stage].update(expected_sha256=manifest["sha256"], computed_sha256=computed,
+                                 expected_size_bytes=manifest["size_bytes"], computed_size_bytes=len(data))
+            if computed != manifest["sha256"] or len(data) != manifest["size_bytes"]:
+                reject("Transferred file SHA-256 or size differs from the registered original.")
+            passed(stage, "The decrypted evidence SHA-256 and byte count match the registered original.")
+
+            stage = "handler_signature"
+            signature_start = time.perf_counter()
+            if (crypto.fingerprint(payload["signer_key"]) != manifest["signer_fingerprint"]
+                or not crypto.verify(payload["signer_key"], crypto.canonical(manifest), payload["evidence_signature"])):
+                reject("Original handler signature is invalid.")
+            signature_ms += milliseconds(signature_start)
+            passed(stage, "The original handler signature validates the acquisition manifest.")
+
+            stage = "custody"
             if not payload["custody"] or not validate_history(payload["custody"], evidence_id):
-                raise Problem("Custody history is invalid.")
+                reject("Custody history signatures, sequence, or hash links are invalid.")
             first = payload["custody"][0]["payload"]
             if (first["node_id"] != manifest["origin_node"] or first["action"] != "registered"
                 or first["actor"] != manifest["handler"] or first["detail"].get("sha256") != manifest["sha256"]):
-                raise Problem("Custody history does not start with the original acquisition.")
+                reject("Custody history does not start with the original acquisition.")
             last = payload["custody"][-1]["payload"]
-            if last["node_id"] != envelope["sender"] or last["action"] != "transfer_prepared" or last["detail"].get("recipient") != self.keys.node_id or last["detail"].get("package_id") != payload["package_id"]:
-                raise Problem("Transfer does not match the sender custody record.")
-            package_id = str(uuid.UUID(payload["package_id"]))
-        except Problem as exc:
-            self.alert(None, f"Transfer rejected: {exc}")
-            self.log(None, actor, "transfer_rejected", {"reason": str(exc)})
-            raise
-        except (KeyError, TypeError, ValueError, InvalidTag, UnicodeError, AttributeError) as exc:
-            self.alert(None, "Transfer rejected: invalid signature, encryption, or package structure.")
-            self.log(None, actor, "transfer_rejected", {"reason": "Invalid package authentication or structure"})
-            raise Problem("Invalid or tampered transfer package.") from exc
-        blob_name = uuid.uuid4().hex + ".enc"
-        path = self.vault / blob_name
-        crypto.write_secret(path, crypto.encrypt(self.keys.master, data, evidence_id.encode()))
-        try:
+            if (last["node_id"] != envelope["sender"] or last["action"] != "transfer_prepared"
+                or last["detail"].get("recipient") != self.keys.node_id
+                or last["detail"].get("package_id") != payload["package_id"]):
+                reject("Transfer does not match the sender's signed custody handoff.")
+            passed(stage, "Every custody signature and hash link is valid; acquisition and handoff match this transfer.")
+
+            stage = "replay"
             with self.db.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 if db.execute("SELECT package_id FROM receipts WHERE package_id=?", (package_id,)).fetchone():
-                    raise Problem("This package has already been received. Replay rejected.", 409)
+                    reject("This package has already been received. Replay rejected.", 409)
                 if db.execute("SELECT id FROM evidence WHERE id=?", (evidence_id,)).fetchone():
-                    raise Problem("This evidence ID is already registered on this node.", 409)
+                    reject("This evidence ID is already registered on this node.", 409)
+                passed(stage, "This package and evidence identifier have not been received before.")
+                stage = "storage"
+                blob_name = uuid.uuid4().hex + ".enc"
+                path = self.vault / blob_name
+                encryption_start = time.perf_counter()
+                encrypted = crypto.encrypt(self.keys.master, data, evidence_id.encode())
+                encryption_ms = milliseconds(encryption_start)
+                crypto.write_secret(path, encrypted)
                 db.execute("INSERT INTO evidence(id,manifest,signature,signer_key,blob_name,imported_history,status,last_verified,registered_at) VALUES(?,?,?,?,?,?,?,?,?)",
                     (evidence_id, crypto.canonical(manifest).decode(), payload["evidence_signature"], payload["signer_key"], blob_name, crypto.canonical(payload["custody"]).decode(), "verified", now(), now()))
                 db.execute("INSERT INTO receipts VALUES(?,?,?)", (package_id, evidence_id, now()))
-                self._append(db, evidence_id, actor, "received", {"sender": envelope["sender"], "package_id": package_id, "hash_valid": True, "signature_valid": True})
-                db.execute("INSERT INTO transfers VALUES(?,?,?,?,?,?,?,?,?)",
-                    (package_id, evidence_id, envelope["sender"], "inbound", "received", len(raw), milliseconds(start), now(), "Hash, handler signature, sender signature and custody validated."))
-        except Problem as exc:
-            path.unlink(missing_ok=True)
-            self.alert(None, f"Transfer rejected: {exc}")
-            self.log(None, actor, "transfer_rejected", {"reason": str(exc)})
-            raise
+                self._append(db, evidence_id, actor, "received", {"sender": envelope["sender"], "package_id": package_id,
+                    "hash_valid": True, "signature_valid": True, "custody_valid": True, "sender_signature_valid": True})
+                elapsed = milliseconds(start)
+                db.execute("INSERT INTO transfers(id,evidence_id,peer_id,direction,status,bytes,elapsed_ms,created_at,detail,decryption_ms) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (package_id, evidence_id, envelope["sender"], "inbound", "received", len(raw), elapsed, now(), "Hash, handler signature, sender signature and custody validated.", decryption_ms))
+                self._metric(db, evidence_id, "package_receive", hash_ms, signature_ms, elapsed, len(data), encryption_ms=encryption_ms, decryption_ms=decryption_ms)
+            passed(stage, "The original was registered in encrypted storage and the receipt was recorded.")
+        except (Problem, KeyError, TypeError, ValueError, InvalidTag, UnicodeError, AttributeError, OSError) as exc:
+            if path is not None:
+                path.unlink(missing_ok=True)
+            message = str(exc) if isinstance(exc, Problem) else generic.get(stage, "The transfer package failed validation.")
+            status = exc.status if isinstance(exc, Problem) else (500 if stage == "storage" else 400)
+            by_key[stage].update(status="failed", detail=message)
+            analysis = {"stage": stage, "reason": message, "summary": "Package rejected. No evidence was added to the vault.",
+                        "evidence_id": evidence_id, "package_id": package_id, "checks": checks, "checked_at": now()}
+            self.alert(evidence_id, f"Transfer rejected: {message}")
+            self.log(None, actor, "transfer_rejected", analysis)
+            raise Problem(message, status, analysis) from exc
         except Exception:
-            path.unlink(missing_ok=True)
+            if path is not None:
+                path.unlink(missing_ok=True)
             raise
         receipt = {"package_id": package_id, "evidence_id": evidence_id, "receiver": self.keys.node_id, "sha256": manifest["sha256"], "received_at": now()}
         return {**receipt, "signature": crypto.sign(self.keys.signing, crypto.canonical(receipt))}
@@ -434,7 +667,10 @@ class EvidenceService:
             elapsed = milliseconds(start)
             with self.db.connect() as db:
                 db.execute("UPDATE transfers SET status='failed',elapsed_ms=?,detail=? WHERE id=?", (elapsed, str(exc)[:500], package_id))
-            self.log(evidence_id, actor, "transfer_failed", {"package_id": package_id, "recipient": peer_id, "delivery": "unconfirmed"})
+            self.log(evidence_id, actor, "transfer_failed", {
+                "package_id": package_id, "recipient": peer_id, "recipient_url": peer["url"],
+                "delivery": "unconfirmed", "reason": str(exc)[:500], "elapsed_ms": elapsed,
+            })
             raise Problem("Delivery could not be confirmed. Check receiver logs before retrying.", 502) from exc
         elapsed = milliseconds(start)
         with self.db.connect() as db:
@@ -453,13 +689,15 @@ class EvidenceService:
 
     def summary(self):
         evidence = self.list_evidence()
+        archived_evidence = self.list_evidence(archived=True)
         events = self.events(all_events=True)
-        return {"node": self.keys.descriptor(self.name), "evidence": evidence,
+        return {"node": self.keys.descriptor(self.name), "evidence": evidence, "archived_evidence": archived_evidence,
+                "processing_metrics_version": 2,
                 "events": list(reversed(events[-100:])), "peers": self.peers(),
                 "alerts": self.db.rows("SELECT * FROM alerts ORDER BY id DESC LIMIT 100"),
                 "transfers": self.db.rows("SELECT * FROM transfers ORDER BY created_at DESC LIMIT 100"),
                 "metrics": self.db.rows("SELECT * FROM metrics ORDER BY id DESC LIMIT 200"),
-                "stats": {"total": len(evidence), "verified": sum(row["status"] == "verified" for row in evidence),
+                "stats": {"total": len(evidence), "archived": len(archived_evidence), "verified": sum(row["status"] == "verified" for row in evidence),
                           "alerts": self.db.one("SELECT COUNT(*) AS count FROM alerts WHERE acknowledged=0")["count"],
                           "transfers": self.db.one("SELECT COUNT(*) AS count FROM transfers")["count"], "audit_valid": validate_history(events)},
-                "max_file_size": self.max_file_size}
+                "max_file_size": self.max_file_size, "max_package_size": self.max_package_size}

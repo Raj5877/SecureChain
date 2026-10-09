@@ -4,6 +4,13 @@ __pycache__/
 .env
 instance/
 demo-data/
+manual-evidence/
+tampered_data/
+sender-data/
+receiver-data/
+lab-certs*/
+captures/
+vm-setup/
 *.scpkg
 *.pcap
 *.pcapng
